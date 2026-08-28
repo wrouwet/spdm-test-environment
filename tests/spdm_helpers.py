@@ -8,12 +8,27 @@ SOM..EOM response is handled here.
 """
 
 import itertools
+import time
 
 import pytest
 
 import mctp
 import spdm
+from bridge import BridgeError
 from config import MCTP_TARGET_ADDR, OUR_EID, OUR_I2C_ADDR, TARGET_EID
+
+# A few ms between transactions. The SPDM/MCTP endpoint (0x10) shares one
+# LPI2C target instance with IPMB (0x20) since the 2026-08-27
+# consolidation; zero-gap back-to-back load occasionally outruns it
+# (missed ACK / response). Harmless but noisy; a real BMC paces sideband
+# polling. Peer-diagnosed 2026-08-28.
+_BUS_PACE_S = 0.008
+
+# Whole-transaction retries on a transient bus glitch (listen timeout,
+# PEC mismatch from a stale capture). Peer-confirmed these don't corrupt
+# state; a re-sent SPDM command is idempotent within the connection.
+_TX_RETRIES = 3
+_TX_RETRY_GAP_S = 0.05
 
 _next_msg_tag = itertools.count()
 
@@ -37,10 +52,21 @@ def send_spdm_command(bridge, message_body, max_fragments=64, max_drain=3):
     """Send one SPDM request (a spdm.build_*() result, msg-type/IC byte
     onward) and return the decoded response dict from
     spdm.parse_response(). Reassembles a multi-packet response. Raises
-    AssertionError / BridgeError on no response -- which is the current
-    reality until SPDM is implemented, hence every caller is
-    not_implemented()-marked.
+    AssertionError / BridgeError if nothing well-formed comes back.
     """
+    last_exc = None
+    for _tx in range(_TX_RETRIES + 1):
+        time.sleep(_BUS_PACE_S if _tx == 0 else _TX_RETRY_GAP_S)
+        try:
+            return _send_spdm_once(bridge, message_body, max_fragments, max_drain)
+        except (BridgeError, ValueError, AssertionError) as exc:
+            last_exc = exc
+            print(f"transient bus glitch ({exc}); re-sending "
+                  f"(attempt {_tx + 2}/{_TX_RETRIES + 1})")
+    raise AssertionError(f"SPDM command failed after {_TX_RETRIES + 1} attempts: {last_exc}")
+
+
+def _send_spdm_once(bridge, message_body, max_fragments, max_drain):
     tag = next_msg_tag()
     transport = mctp.build_transport_header(
         TARGET_EID, OUR_EID, msg_tag=tag, tag_owner=1, som=1, eom=1, pkt_seq=0
