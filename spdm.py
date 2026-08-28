@@ -85,8 +85,22 @@ CAP_FLAG_BITS = {
     16: "PUB_KEY_ID_CAP", 17: "CHUNK_CAP", 18: "ALIAS_CERT_CAP",
 }
 
-# ----- MeasurementSpecification / algorithm bits --------------------
+# ----- MeasurementSpecification / algorithm bits (DSP0274) ----------
 MEAS_SPEC_DMTF = 0x01
+
+# BaseAsymAlgo bitfield.
+ASYM_RSASSA_2048 = 0x0001
+ASYM_ECDSA_P256 = 0x0010
+ASYM_ECDSA_P384 = 0x0080
+ASYM_ECDSA_P521 = 0x0100
+# raw r||s signature sizes by curve.
+ASYM_SIG_SIZE = {ASYM_ECDSA_P256: 64, ASYM_ECDSA_P384: 96, ASYM_ECDSA_P521: 132}
+
+# BaseHashAlgo bitfield.
+HASH_SHA_256 = 0x01
+HASH_SHA_384 = 0x02
+HASH_SHA_512 = 0x04
+HASH_SIZE = {HASH_SHA_256: 32, HASH_SHA_384: 48, HASH_SHA_512: 64}
 
 # GET_MEASUREMENTS Param2 = the measurement operation.
 MEAS_OP_TOTAL_NUMBER = 0x00       # request total number of measurement blocks
@@ -118,22 +132,50 @@ def build_get_capabilities(version=V11, ct_exponent=0, flags=0,
     return build_request(REQ_GET_CAPABILITIES, 0, 0, payload, version=version)
 
 
-def build_negotiate_algorithms(version=V11, base_asym_algo=0, base_hash_algo=0):
-    """A minimal NEGOTIATE_ALGORITHMS with no ReqAlgStruct tables
-    (Param1 = 0): Length(2 LE) MeasurementSpecification(1) Reserved(1)
-    BaseAsymAlgo(4 LE) BaseHashAlgo(4 LE) Reserved(12) ExtAsymCount(1)=0
-    ExtHashCount(1)=0 Reserved(2). Enough to elicit an ALGORITHMS or
-    ERROR response; not a real negotiation."""
-    body = bytearray()
-    body += bytes([MEAS_SPEC_DMTF, 0x00])
+def build_negotiate_algorithms(version=V11,
+                               base_asym_algo=ASYM_ECDSA_P256 | ASYM_ECDSA_P384,
+                               base_hash_algo=HASH_SHA_256 | HASH_SHA_384):
+    """NEGOTIATE_ALGORITHMS with no ReqAlgStruct tables (Param1 = 0).
+
+    On the wire, from the SPDM message header onward:
+      SPDMVersion RequestResponseCode Param1(=0) Param2(=0)
+      Length(2 LE)  -- the WHOLE message length, header included
+      MeasurementSpecification(1)  OtherParamsSupport(1, 0 for <1.2)
+      BaseAsymAlgo(4 LE)  BaseHashAlgo(4 LE)  Reserved(12)
+      ExtAsymCount(1)=0  ExtHashCount(1)=0  Reserved(2)
+    Total = 4 + 2 + 1 + 1 + 4 + 4 + 12 + 1 + 1 + 2 = 32 bytes.
+
+    The earlier version got Length wrong (excluded the 2-byte Length
+    field) and sent zero algorithm bitfields -- libspdm rejected both as
+    InvalidRequest. Defaults now offer P-256/P-384 + SHA-256/384 to
+    match the responder.
+    """
+    body = bytes([MEAS_SPEC_DMTF, 0x00])
     body += struct.pack("<I", base_asym_algo)
     body += struct.pack("<I", base_hash_algo)
     body += bytes(12)
     body += bytes([0x00, 0x00])  # ExtAsymCount, ExtHashCount
     body += bytes([0x00, 0x00])  # Reserved
-    length = 4 + len(body)       # + the fixed 4-byte SPDM message header
-    payload = struct.pack("<H", length) + bytes(body)
+    length = 4 + 2 + len(body)   # SPDM header(4) + Length field(2) + body
+    payload = struct.pack("<H", length) + body
     return build_request(REQ_NEGOTIATE_ALGORITHMS, 0, 0, payload, version=version)
+
+
+def parse_algorithms(resp):
+    """Decode an ALGORITHMS response (spdm.parse_response() dict for a
+    RESP_ALGORITHMS). data layout from Param1/Param2 onward:
+      Length(2 LE) MeasurementSpecificationSel(1) OtherParamsSel(1)
+      MeasurementHashAlgo(4 LE) BaseAsymSel(4 LE) BaseHashSel(4 LE)
+      Reserved(12) ExtAsymSelCount(1) ExtHashSelCount(1) Reserved(2) ...
+    """
+    d = resp["data"]
+    if len(d) < 32:
+        return {"raw": d.hex(" ")}
+    return {
+        "measurement_hash_algo": int.from_bytes(d[4:8], "little"),
+        "base_asym_sel": int.from_bytes(d[8:12], "little"),
+        "base_hash_sel": int.from_bytes(d[12:16], "little"),
+    }
 
 
 def build_get_digests(version=V11):
@@ -246,9 +288,126 @@ def _parse_measurements(param1, data):
         return {"raw": data.hex(" ")}
     number_of_blocks = data[0]
     record_len = int.from_bytes(data[1:4], "little")
-    return {
+    record = data[4:4 + record_len]
+    off = 4 + record_len
+    out = {
         "total_number_via_param1": param1,
         "number_of_blocks": number_of_blocks,
         "measurement_record_length": record_len,
-        "measurement_record": data[4:4 + record_len],
+        "measurement_record": record,
+        "blocks": _parse_measurement_blocks(record),
     }
+    if len(data) >= off + 32:
+        out["nonce"] = data[off:off + 32]
+        off += 32
+        if len(data) >= off + 2:
+            opaque_len = int.from_bytes(data[off:off + 2], "little")
+            off += 2
+            out["opaque"] = data[off:off + opaque_len]
+            off += opaque_len
+            out["signature"] = data[off:]
+    return out
+
+
+def _parse_measurement_blocks(record):
+    """Split a MeasurementRecord into DMTF measurement blocks. Each block:
+    4-byte common header (Index u8, MeasurementSpecification u8=0x01,
+    MeasurementSize u16 LE) + the DMTF measurement value, which itself is
+    3-byte DMTF header (DMTFSpecMeasurementValueType u8,
+    DMTFSpecMeasurementValueSize u16 LE) + value bytes.
+    """
+    blocks = []
+    i = 0
+    while i + 4 <= len(record):
+        index = record[i]
+        spec = record[i + 1]
+        size = int.from_bytes(record[i + 2:i + 4], "little")
+        value = record[i + 4:i + 4 + size]
+        blk = {"index": index, "spec": spec, "size": size}
+        if len(value) >= 3:
+            blk["value_type"] = value[0]
+            blk["value_size"] = int.from_bytes(value[1:3], "little")
+            blk["value"] = value[3:3 + blk["value_size"]]
+        blocks.append(blk)
+        i += 4 + size
+    return blocks
+
+
+def parse_digests(resp, hash_size):
+    """DIGESTS response: Param2 = slot mask; data = one `hash_size`
+    digest per set bit in the mask, in ascending slot order."""
+    slot_mask = resp["param2"]
+    d = resp["data"]
+    n = bin(slot_mask).count("1")
+    return {
+        "slot_mask": slot_mask,
+        "digests": [d[i * hash_size:(i + 1) * hash_size] for i in range(n)],
+    }
+
+
+def parse_certificate(resp):
+    """CERTIFICATE response: data = PortionLength(2 LE) RemainderLength(2 LE)
+    CertChain portion(PortionLength)."""
+    d = resp["data"]
+    if len(d) < 4:
+        return {"raw": d.hex(" ")}
+    portion = int.from_bytes(d[0:2], "little")
+    remainder = int.from_bytes(d[2:4], "little")
+    return {
+        "slot": resp["param1"] & 0x0F,
+        "portion_length": portion,
+        "remainder_length": remainder,
+        "cert_chain_portion": d[4:4 + portion],
+    }
+
+
+def parse_challenge_auth(resp, hash_size, sig_size, meas_summary=False):
+    """CHALLENGE_AUTH response: data = CertChainHash(hash_size)
+    Nonce(32) [MeasurementSummaryHash(hash_size)] OpaqueLength(2 LE)
+    OpaqueData(N) Signature(sig_size). Param1 = slot mask (bit7 = basic
+    mutual-auth req), Param2 = slot id."""
+    d = resp["data"]
+    off = 0
+    out = {"slot_mask": resp["param1"], "slot_id": resp["param2"] & 0x0F}
+    out["cert_chain_hash"] = d[off:off + hash_size]; off += hash_size
+    out["nonce"] = d[off:off + 32]; off += 32
+    if meas_summary:
+        out["measurement_summary_hash"] = d[off:off + hash_size]; off += hash_size
+    if len(d) >= off + 2:
+        opaque_len = int.from_bytes(d[off:off + 2], "little"); off += 2
+        out["opaque"] = d[off:off + opaque_len]; off += opaque_len
+    out["signature"] = d[off:off + sig_size]
+    return out
+
+
+def parse_cert_chain(chain):
+    """Extract the DER X.509 cert(s) from a reassembled GET_CERTIFICATE
+    payload.
+
+    DSP0274's cert-chain format is Length(2 LE) Reserved(2)
+    RootHash(hash_size) then DER cert(s). This OpenBIC/libspdm build
+    (2026-08-28) instead returns the raw DER directly, with no wrapper --
+    so both shapes are handled: if the payload already starts with a DER
+    SEQUENCE (0x30 0x82) it's taken as-is, otherwise the wrapper is
+    stripped by locating the first 0x30 0x82 after the 4-byte header.
+    Returns {"der": ..., "wrapped": bool[, "root_hash": ...]}.
+    """
+    if len(chain) < 4:
+        return None
+    if chain[:2] == b"\x30\x82":
+        return {"der": bytes(chain), "wrapped": False}
+    declared = int.from_bytes(chain[0:2], "little")
+    for hs in (32, 48, 64):
+        if len(chain) > 4 + hs and chain[4 + hs:4 + hs + 2] == b"\x30\x82":
+            return {"declared_length": declared, "root_hash": chain[4:4 + hs],
+                    "der": bytes(chain[4 + hs:]), "wrapped": True}
+    return {"declared_length": declared, "der": bytes(chain[4:]), "wrapped": True}
+
+
+def der_cert_len(der):
+    """Total length of the first DER SEQUENCE (tag + 2-byte length +
+    body), i.e. one X.509 certificate. Assumes the 0x82 (2-byte length)
+    form, which every real cert uses."""
+    if len(der) < 4 or der[0] != 0x30 or der[1] != 0x82:
+        return None
+    return 4 + int.from_bytes(der[2:4], "big")

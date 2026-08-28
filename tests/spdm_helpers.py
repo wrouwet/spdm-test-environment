@@ -92,6 +92,71 @@ def send_spdm_command(bridge, message_body, max_fragments=64, max_drain=3):
     return decoded
 
 
+def establish_connection(bridge, version=spdm.V11):
+    """Run the SPDM opening handshake -- GET_VERSION, GET_CAPABILITIES,
+    NEGOTIATE_ALGORITHMS -- and return the negotiated parameters
+    (version, hash_size, sig_size, ...) that every command past
+    NEGOTIATE_ALGORITHMS needs. libspdm's responder tracks connection
+    state, so GET_DIGESTS / GET_CERTIFICATE / CHALLENGE /
+    GET_MEASUREMENTS return ERROR until this has completed in the same
+    session.
+    """
+    v = send_spdm_command(bridge, spdm.build_get_version())
+    assert v["code"] == spdm.RESP_VERSION, f"GET_VERSION -> {v['code_name']}"
+
+    c = send_spdm_command(bridge, spdm.build_get_capabilities(version=version))
+    assert c["code"] == spdm.RESP_CAPABILITIES, f"GET_CAPABILITIES -> {c['code_name']}"
+
+    a = send_spdm_command(bridge, spdm.build_negotiate_algorithms(version=version))
+    assert a["code"] == spdm.RESP_ALGORITHMS, (
+        f"NEGOTIATE_ALGORITHMS -> {a['code_name']}"
+        + (f" ({a['error_name']})" if a["code"] == spdm.RESP_ERROR else "")
+    )
+    algs = spdm.parse_algorithms(a)
+    hash_size = spdm.HASH_SIZE.get(algs["base_hash_sel"], 32)
+    sig_size = spdm.ASYM_SIG_SIZE.get(algs["base_asym_sel"], 64)
+    conn = {
+        "version": version,
+        "base_hash_sel": algs["base_hash_sel"],
+        "base_asym_sel": algs["base_asym_sel"],
+        "hash_size": hash_size,
+        "sig_size": sig_size,
+        "capabilities": c.get("capabilities", {}),
+    }
+    print(f"SPDM connection: {conn}")
+    return conn
+
+
+def full_attestation_prelude(bridge, conn, slot=0):
+    """After establish_connection, walk GET_DIGESTS + GET_CERTIFICATE so
+    the libspdm responder's connection state is where it wants to be
+    before CHALLENGE / signed GET_MEASUREMENTS (per the responder's own
+    end-to-end sequence: VERSION -> CAPABILITIES -> ALGORITHMS ->
+    DIGESTS -> CERTIFICATE -> CHALLENGE -> MEASUREMENTS)."""
+    dg = send_spdm_command(bridge, spdm.build_get_digests(version=conn["version"]))
+    assert dg["code"] == spdm.RESP_DIGESTS, f"GET_DIGESTS -> {dg['code_name']}"
+    chain = get_full_cert_chain(bridge, conn, slot=slot)
+    return chain
+
+
+def get_full_cert_chain(bridge, conn, slot=0, chunk=0x200):
+    """Walk GET_CERTIFICATE by Offset += PortionLength until
+    RemainderLength == 0. Returns the full cert-chain bytes for `slot`.
+    """
+    chain = bytearray()
+    offset = 0
+    for _ in range(64):
+        r = send_spdm_command(bridge, spdm.build_get_certificate(
+            slot=slot, offset=offset, length=chunk, version=conn["version"]))
+        assert r["code"] == spdm.RESP_CERTIFICATE, f"GET_CERTIFICATE -> {r['code_name']}"
+        c = spdm.parse_certificate(r)
+        chain += c["cert_chain_portion"]
+        offset += c["portion_length"]
+        if c["remainder_length"] == 0:
+            break
+    return bytes(chain)
+
+
 def get_mctp_message_types(bridge):
     """Ask the MCTP endpoint (Get Message Type Support, cmd 0x05) which
     message types it handles. Returns a list of type bytes. Used by the

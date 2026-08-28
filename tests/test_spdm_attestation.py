@@ -1,73 +1,157 @@
 """SPDM identity + attestation (DSP0274 §11-12):
 GET_DIGESTS -> GET_CERTIFICATE -> CHALLENGE -> GET_MEASUREMENTS.
 
-Spec-derived, all not_implemented() until the firmware gains SPDM. These
-assume discovery/negotiation (test_spdm_discovery.py) already succeeded;
-once that flips, work through these in order.
+libspdm's responder tracks connection state, so every test here runs the
+opening handshake (spdm_helpers.establish_connection) first.
 """
 
+import pytest
+
 import spdm
-from spdm_helpers import not_implemented, send_spdm_command
+from spdm_helpers import (
+    establish_connection,
+    full_attestation_prelude,
+    get_full_cert_chain,
+    not_implemented,
+    send_spdm_command,
+)
+from config import (
+    DMTF_MEAS_VALUE_TYPE_IMMUTABLE_ROM,
+    EXPECTED_MEASUREMENT_BLOCK_COUNT,
+    MEASUREMENT_BLOCK_INDEX,
+    POPULATED_CERT_SLOTS,
+)
 
-_GAP = ("SPDM not implemented on this OpenBIC port yet -- see "
-        "test_spdm_transport.py; depends on discovery/negotiation working first.")
 
-
-@not_implemented(_GAP)
 def test_get_digests(bridge):
-    """GET_DIGESTS returns a DIGESTS response whose Param2 slot-mask has
-    at least slot 0 populated, with one hash-length digest per set bit."""
-    d = send_spdm_command(bridge, spdm.build_get_digests())
+    """GET_DIGESTS returns a DIGESTS response whose slot mask has slot 0
+    populated, with one negotiated-hash-size digest per set bit."""
+    conn = establish_connection(bridge)
+    d = send_spdm_command(bridge, spdm.build_get_digests(version=conn["version"]))
     assert d["code"] == spdm.RESP_DIGESTS, f"expected DIGESTS, got {d['code_name']}"
-    slot_mask = d["param2"]
-    print(f"populated cert slot mask: 0x{slot_mask:02x}")
-    assert slot_mask & 0x01, "slot 0 should hold a certificate chain"
-    assert len(d["data"]) % max(bin(slot_mask).count("1"), 1) == 0, (
-        "digest data length should be a whole multiple of the number of populated slots"
+    parsed = spdm.parse_digests(d, conn["hash_size"])
+    print(f"digests: slot_mask=0x{parsed['slot_mask']:02x}, "
+          f"{[h.hex() for h in parsed['digests']]}")
+    for slot in POPULATED_CERT_SLOTS:
+        assert parsed["slot_mask"] & (1 << slot), f"slot {slot} not in digest mask"
+    assert parsed["digests"] and len(parsed["digests"][0]) == conn["hash_size"], (
+        f"digest length {len(parsed['digests'][0]) if parsed['digests'] else 0} "
+        f"!= negotiated hash size {conn['hash_size']}"
     )
 
 
-@not_implemented(_GAP)
-def test_get_certificate_slot0(bridge):
-    """GET_CERTIFICATE for slot 0 returns a CERTIFICATE response; walking
-    Offset by PortionLength until RemainderLength == 0 yields a complete
-    DER cert chain that starts with the 4+2-byte SPDM cert-chain header."""
-    d = send_spdm_command(bridge, spdm.build_get_certificate(slot=0, offset=0, length=0x400))
-    assert d["code"] == spdm.RESP_CERTIFICATE, f"expected CERTIFICATE, got {d['code_name']}"
-    # data: PortionLength(2 LE) RemainderLength(2 LE) CertChain portion(N)
-    assert len(d["data"]) >= 4, f"CERTIFICATE response too short: {d['data'].hex(' ')}"
+def test_get_certificate_slot0_is_a_der_x509_cert(bridge):
+    """GET_CERTIFICATE for slot 0, walked to completion, yields a DER
+    X.509 certificate (a single self-signed cert on this platform).
+
+    NOTE: this build returns the raw DER with no DSP0274 cert-chain
+    wrapper (Length/Reserved/RootHash) -- see spdm.parse_cert_chain and
+    the open question with the firmware peer. Once the wrapper is added
+    this test still passes (parse_cert_chain handles both).
+    """
+    conn = establish_connection(bridge)
+    chain = get_full_cert_chain(bridge, conn, slot=0)
+    print(f"cert chain: {len(chain)} bytes, wrapped={spdm.parse_cert_chain(chain).get('wrapped')}")
+    der = spdm.parse_cert_chain(chain)["der"]
+    assert der[:2] == b"\x30\x82", f"not a DER SEQUENCE: {der[:8].hex(' ')}"
+    cert_len = spdm.der_cert_len(der)
+    assert cert_len is not None, "DER length header not the expected 0x82 form"
+    # single-cert: the first cert consumes essentially the whole blob.
+    assert abs(len(der) - cert_len) <= 4, (
+        f"expected a single-cert chain (first cert ~{cert_len} B), got {len(der)} B"
+    )
 
 
-@not_implemented(_GAP)
-def test_challenge_slot0(bridge):
+@not_implemented(
+    "responder returns ERROR/Unspecified (0x05) for CHALLENGE from this requester, "
+    "even after the full VERSION->CAPABILITIES->ALGORITHMS->DIGESTS->CERTIFICATE "
+    "prelude. Every UNSIGNED op works (digests, cert, measurement count); every "
+    "SIGNED op (this + signed GET_MEASUREMENTS) returns Unspecified -- points at "
+    "the responder's signing/crypto path, not the request framing. Flagged to the "
+    "firmware peer 2026-08-28."
+)
+def test_challenge_slot0_returns_signed_challenge_auth(bridge):
     """CHALLENGE against slot 0 with a fresh nonce returns CHALLENGE_AUTH
-    carrying a CertChainHash, the responder's own Nonce, and a
-    Signature -- the core device-authentication step."""
-    d = send_spdm_command(bridge, spdm.build_challenge(slot=0, measurement_summary_hash_type=0x00))
-    assert d["code"] == spdm.RESP_CHALLENGE_AUTH, f"expected CHALLENGE_AUTH, got {d['code_name']}"
-    assert len(d["data"]) >= 32 + 32, "CHALLENGE_AUTH should carry at least a hash + nonce"
+    carrying a CertChainHash, a responder Nonce, and a Signature of the
+    negotiated size."""
+    conn = establish_connection(bridge)
+    full_attestation_prelude(bridge, conn, slot=0)
+    d = send_spdm_command(bridge, spdm.build_challenge(
+        slot=0, measurement_summary_hash_type=0x00, version=conn["version"]))
+    assert d["code"] == spdm.RESP_CHALLENGE_AUTH, (
+        f"expected CHALLENGE_AUTH, got {d['code_name']}"
+        + (f" ({d['error_name']})" if d["code"] == spdm.RESP_ERROR else "")
+    )
+    ca = spdm.parse_challenge_auth(d, conn["hash_size"], conn["sig_size"], meas_summary=False)
+    print(f"challenge_auth: cert_hash={ca['cert_chain_hash'].hex()[:16]}..., "
+          f"nonce={ca['nonce'].hex()[:16]}..., sig={len(ca['signature'])} B")
+    assert len(ca["cert_chain_hash"]) == conn["hash_size"]
+    assert len(ca["nonce"]) == 32
+    assert len(ca["signature"]) == conn["sig_size"], (
+        f"signature {len(ca['signature'])} B != negotiated {conn['sig_size']} B"
+    )
+    assert any(ca["signature"]), "signature is all zeros"
 
 
-@not_implemented(_GAP)
 def test_get_measurements_total_count(bridge):
     """GET_MEASUREMENTS with operation = 'request total number' returns a
-    MEASUREMENTS response whose Param1 is the number of measurement
-    blocks the device exposes (>= 1)."""
-    d = send_spdm_command(bridge, spdm.build_get_measurements(operation=spdm.MEAS_OP_TOTAL_NUMBER))
-    assert d["code"] == spdm.RESP_MEASUREMENTS, f"expected MEASUREMENTS, got {d['code_name']}"
-    total = d["measurements"]["total_number_via_param1"]
-    print(f"device exposes {total} measurement block(s)")
-    assert total >= 1, "an attestable device should expose at least one measurement block"
-
-
-@not_implemented(_GAP)
-def test_get_measurements_all_blocks_signed(bridge):
-    """GET_MEASUREMENTS for all blocks with signature requested returns a
-    MEASUREMENTS response with a non-empty measurement record and a
-    trailing signature."""
+    MEASUREMENTS response with NumberOfBlocks 0 and the total count in
+    Param1 (1 on this platform)."""
+    conn = establish_connection(bridge)
     d = send_spdm_command(bridge, spdm.build_get_measurements(
-        operation=spdm.MEAS_OP_ALL_BLOCKS, request_attributes=0x01))
+        operation=spdm.MEAS_OP_TOTAL_NUMBER, version=conn["version"]))
     assert d["code"] == spdm.RESP_MEASUREMENTS, f"expected MEASUREMENTS, got {d['code_name']}"
-    rec = d["measurements"]["measurement_record"]
-    print(f"measurement record: {len(rec)} bytes, {d['measurements']['number_of_blocks']} block(s)")
-    assert d["measurements"]["number_of_blocks"] >= 1 and len(rec) >= 1
+    m = d["measurements"]
+    print(f"total measurement blocks (Param1): {m['total_number_via_param1']}")
+    assert m["number_of_blocks"] == 0
+    assert m["total_number_via_param1"] == EXPECTED_MEASUREMENT_BLOCK_COUNT
+
+
+@not_implemented(
+    "responder returns ERROR/Unspecified (0x05) for GET_MEASUREMENTS operation 0xFF "
+    "(return the actual measurement records) -- signed OR unsigned, with or without "
+    "the DIGESTS->CERTIFICATE prelude. Operation 0x00 (total count) works and "
+    "reports 1 block. So record retrieval + signing are broken responder-side, not "
+    "the request framing. Flagged to the firmware peer 2026-08-28. When fixed this "
+    "should assert: 1 block, index 1, DMTF IMMUTABLE_ROM, a 256/384-bit digest, a "
+    "signature of the negotiated size, and digest stability across two reads."
+)
+def test_get_measurements_all_blocks(bridge):
+    """GET_MEASUREMENTS operation 0xFF returns the IMMUTABLE_ROM block
+    (index 1) and, with a signature requested, a signature of the
+    negotiated size; the digest of the fixed 32 KB flash window is
+    stable across reads."""
+    conn = establish_connection(bridge)
+    full_attestation_prelude(bridge, conn, slot=0)
+
+    def read_all(sign):
+        d = send_spdm_command(bridge, spdm.build_get_measurements(
+            operation=spdm.MEAS_OP_ALL_BLOCKS, request_attributes=(0x01 if sign else 0x00),
+            version=conn["version"]))
+        assert d["code"] == spdm.RESP_MEASUREMENTS, f"expected MEASUREMENTS, got {d['code_name']}"
+        return d["measurements"]
+
+    m = read_all(sign=True)
+    assert len(m["blocks"]) == EXPECTED_MEASUREMENT_BLOCK_COUNT
+    blk = m["blocks"][0]
+    assert blk["index"] == MEASUREMENT_BLOCK_INDEX
+    assert blk["spec"] == spdm.MEAS_SPEC_DMTF
+    assert blk.get("value_type") == DMTF_MEAS_VALUE_TYPE_IMMUTABLE_ROM
+    assert len(blk["value"]) in (32, 48)
+    assert len(m["signature"]) == conn["sig_size"] and any(m["signature"])
+    assert read_all(sign=False)["blocks"][0]["value"] == blk["value"], (
+        "measurement digest changed between reads -- should be stable"
+    )
+
+
+@not_implemented(
+    "cryptographic signature verification not implemented yet: needs the "
+    "`cryptography` package plus SPDM L1/L2 (measurements) and M1/M2 (challenge) "
+    "transcript-hash reconstruction to verify the ECDSA signature against the "
+    "slot-0 cert's public key. Structural checks (size, non-zero, stability) are "
+    "in the tests above; this is the real attestation check and its own task."
+)
+def test_challenge_auth_signature_verifies(bridge):
+    """Verify the CHALLENGE_AUTH signature against the slot-0 leaf
+    certificate's public key over the reconstructed M2 transcript."""
+    pytest.fail("not implemented -- see marker reason")
