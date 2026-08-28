@@ -5,15 +5,15 @@ libspdm's responder tracks connection state, so every test here runs the
 opening handshake (spdm_helpers.establish_connection) first.
 """
 
-import pytest
+import os
 
 import spdm
 from spdm_helpers import (
     establish_connection,
     full_attestation_prelude,
     get_full_cert_chain,
-    not_implemented,
     send_spdm_command,
+    send_spdm_recorded,
 )
 from config import (
     DMTF_MEAS_VALUE_TYPE_IMMUTABLE_ROM,
@@ -127,14 +127,83 @@ def test_get_measurements_all_blocks(bridge):
     )
 
 
-@not_implemented(
-    "cryptographic signature verification not implemented yet: needs the "
-    "`cryptography` package plus SPDM L1/L2 (measurements) and M1/M2 (challenge) "
-    "transcript-hash reconstruction to verify the ECDSA signature against the "
-    "slot-0 cert's public key. Structural checks (size, non-zero, stability) are "
-    "in the tests above; this is the real attestation check and its own task."
-)
 def test_challenge_auth_signature_verifies(bridge):
-    """Verify the CHALLENGE_AUTH signature against the slot-0 leaf
-    certificate's public key over the reconstructed M2 transcript."""
-    pytest.fail("not implemented -- see marker reason")
+    """The real attestation check: verify the CHALLENGE_AUTH ECDSA
+    signature against the slot-0 leaf certificate's public key over the
+    reconstructed M2 transcript.
+
+    M2 (DSP0274 1.1) = every SPDM message, SPDMVersion byte onward, in
+    order:  GET_VERSION, VERSION, GET_CAPABILITIES, CAPABILITIES,
+    NEGOTIATE_ALGORITHMS, ALGORITHMS, GET_DIGESTS, DIGESTS,
+    GET_CERTIFICATE(s), CERTIFICATE(s), CHALLENGE,
+    CHALLENGE_AUTH-without-its-Signature.  Signature = ECDSA_Sign(priv,
+    negotiated_hash(M2)).  No 1.2+ signing-context prefix at v1.1.
+    """
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.asymmetric.utils import encode_dss_signature
+    from cryptography.exceptions import InvalidSignature
+    from cryptography.x509 import load_der_x509_certificate
+
+    ver = spdm.V11
+    t = bytearray()
+
+    v = send_spdm_recorded(bridge, spdm.build_get_version(), t)
+    assert v["code"] == spdm.RESP_VERSION
+    send_spdm_recorded(bridge, spdm.build_get_capabilities(version=ver), t)
+    a = send_spdm_recorded(bridge, spdm.build_negotiate_algorithms(version=ver), t)
+    assert a["code"] == spdm.RESP_ALGORITHMS
+    algs = spdm.parse_algorithms(a)
+    hash_size = spdm.HASH_SIZE[algs["base_hash_sel"]]
+    sig_size = spdm.ASYM_SIG_SIZE[algs["base_asym_sel"]]
+
+    dg = send_spdm_recorded(bridge, spdm.build_get_digests(version=ver), t)
+    assert dg["code"] == spdm.RESP_DIGESTS
+
+    chain = bytearray()
+    offset = 0
+    for _ in range(64):
+        r = send_spdm_recorded(bridge, spdm.build_get_certificate(
+            slot=0, offset=offset, length=0x200, version=ver), t)
+        assert r["code"] == spdm.RESP_CERTIFICATE
+        c = spdm.parse_certificate(r)
+        chain += c["cert_chain_portion"]
+        offset += c["portion_length"]
+        if c["remainder_length"] == 0:
+            break
+
+    nonce = os.urandom(32)
+    chal = spdm.build_challenge(slot=0, measurement_summary_hash_type=0x00,
+                               nonce=nonce, version=ver)
+    t += bytes(chal[1:])                      # CHALLENGE request
+    ca = send_spdm_command(bridge, chal)
+    assert ca["code"] == spdm.RESP_CHALLENGE_AUTH, f"got {ca['code_name']}"
+    parsed = spdm.parse_challenge_auth(ca, hash_size, sig_size, meas_summary=False)
+    signature = parsed["signature"]
+    assert len(signature) == sig_size
+    t += ca["_spdm_msg"][:-sig_size]          # CHALLENGE_AUTH minus Signature
+
+    # leaf cert public key
+    der = spdm.parse_cert_chain(bytes(chain))["der"]
+    cert = load_der_x509_certificate(der[:spdm.der_cert_len(der)])
+    pub = cert.public_key()
+    assert isinstance(pub, ec.EllipticCurvePublicKey), f"unexpected key type {type(pub)}"
+
+    # SPDM ECDSA signatures are raw r||s (fixed-width, big-endian); the
+    # `cryptography` API wants a DER-encoded (r, s) pair.
+    half = sig_size // 2
+    der_sig = encode_dss_signature(
+        int.from_bytes(signature[:half], "big"),
+        int.from_bytes(signature[half:], "big"),
+    )
+    hash_alg = {32: hashes.SHA256(), 48: hashes.SHA384(), 64: hashes.SHA512()}[hash_size]
+    try:
+        pub.verify(der_sig, bytes(t), ec.ECDSA(hash_alg))
+    except InvalidSignature:
+        raise AssertionError(
+            f"CHALLENGE_AUTH signature did NOT verify against the slot-0 cert "
+            f"(transcript {len(t)} B, {hash_alg.name}, {pub.curve.name})"
+        )
+    print(f"CHALLENGE_AUTH signature verified: {pub.curve.name} / {hash_alg.name}, "
+          f"M2 transcript {len(t)} B, cert CN="
+          f"{cert.subject.rfc4514_string()}")

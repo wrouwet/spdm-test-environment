@@ -88,7 +88,22 @@ def send_spdm_command(bridge, message_body, max_fragments=64, max_drain=3):
         raise AssertionError(f"no EOM after {max_fragments} fragments")
 
     decoded = spdm.parse_response(bytes(body))
+    # The full SPDM message with the MCTP message-type byte stripped --
+    # i.e. from the SPDMVersion byte onward. This is exactly the unit the
+    # SPDM signature transcript (M1/M2, L1/L2) is built from.
+    decoded["_spdm_msg"] = bytes(body[1:])
     print(f"decoded: {decoded}")
+    return decoded
+
+
+def send_spdm_recorded(bridge, message_body, transcript):
+    """send_spdm_command, but append this exchange's request and response
+    SPDM messages (SPDMVersion byte onward, no MCTP framing) to
+    `transcript` (a bytearray) -- for reconstructing the signature
+    transcript."""
+    transcript += bytes(message_body[1:])
+    decoded = send_spdm_command(bridge, message_body)
+    transcript += decoded["_spdm_msg"]
     return decoded
 
 
