@@ -44,10 +44,10 @@ def test_get_certificate_slot0_is_a_der_x509_cert(bridge):
     """GET_CERTIFICATE for slot 0, walked to completion, yields a DER
     X.509 certificate (a single self-signed cert on this platform).
 
-    NOTE: this build returns the raw DER with no DSP0274 cert-chain
-    wrapper (Length/Reserved/RootHash) -- see spdm.parse_cert_chain and
-    the open question with the firmware peer. Once the wrapper is added
-    this test still passes (parse_cert_chain handles both).
+    The payload is the DSP0274 cert-chain: Length(2 LE) Reserved(2)
+    RootHash(48, SHA-384 of the leaf DER) then the 474 B cert
+    (526 B total). parse_cert_chain also accepts a bare-DER payload for
+    forward/backward compatibility.
     """
     conn = establish_connection(bridge)
     chain = get_full_cert_chain(bridge, conn, slot=0)
@@ -62,14 +62,6 @@ def test_get_certificate_slot0_is_a_der_x509_cert(bridge):
     )
 
 
-@not_implemented(
-    "responder returns ERROR/Unspecified (0x05) for CHALLENGE from this requester, "
-    "even after the full VERSION->CAPABILITIES->ALGORITHMS->DIGESTS->CERTIFICATE "
-    "prelude. Every UNSIGNED op works (digests, cert, measurement count); every "
-    "SIGNED op (this + signed GET_MEASUREMENTS) returns Unspecified -- points at "
-    "the responder's signing/crypto path, not the request framing. Flagged to the "
-    "firmware peer 2026-08-28."
-)
 def test_challenge_slot0_returns_signed_challenge_auth(bridge):
     """CHALLENGE against slot 0 with a fresh nonce returns CHALLENGE_AUTH
     carrying a CertChainHash, a responder Nonce, and a Signature of the
@@ -107,15 +99,6 @@ def test_get_measurements_total_count(bridge):
     assert m["total_number_via_param1"] == EXPECTED_MEASUREMENT_BLOCK_COUNT
 
 
-@not_implemented(
-    "responder returns ERROR/Unspecified (0x05) for GET_MEASUREMENTS operation 0xFF "
-    "(return the actual measurement records) -- signed OR unsigned, with or without "
-    "the DIGESTS->CERTIFICATE prelude. Operation 0x00 (total count) works and "
-    "reports 1 block. So record retrieval + signing are broken responder-side, not "
-    "the request framing. Flagged to the firmware peer 2026-08-28. When fixed this "
-    "should assert: 1 block, index 1, DMTF IMMUTABLE_ROM, a 256/384-bit digest, a "
-    "signature of the negotiated size, and digest stability across two reads."
-)
 def test_get_measurements_all_blocks(bridge):
     """GET_MEASUREMENTS operation 0xFF returns the IMMUTABLE_ROM block
     (index 1) and, with a signature requested, a signature of the
